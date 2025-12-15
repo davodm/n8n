@@ -47,15 +47,21 @@ jobs:
         
         if [ -n "$TARGET_TAG" ]; then
           git checkout "$TARGET_TAG"
+          # Store original version for labels
           echo "N8N_VERSION=$TARGET_TAG" >> $GITHUB_ENV
+          # Sanitize version for Docker tag (replace @ with - and remove invalid chars)
+          DOCKER_TAG_VERSION=$(echo "$TARGET_TAG" | sed 's/@/-/g' | sed 's/[^a-zA-Z0-9._-]//g')
+          echo "N8N_DOCKER_TAG=$DOCKER_TAG_VERSION" >> $GITHUB_ENV
         else
           echo "N8N_VERSION=dev" >> $GITHUB_ENV
+          echo "N8N_DOCKER_TAG=dev" >> $GITHUB_ENV
         fi
         
         N8N_COMMIT_HASH=$(git rev-parse --short HEAD)
         echo "Cloned n8n repository successfully"
         echo "Current commit: $N8N_COMMIT_HASH"
         echo "N8N_COMMIT_HASH=$N8N_COMMIT_HASH" >> $GITHUB_ENV
+        echo "Docker tag version: $DOCKER_TAG_VERSION"
 
     - name: Copy bypass script to n8n repository
       run: |
@@ -170,7 +176,7 @@ jobs:
         tags: |
           ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.IMAGE_TAG }}
           ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:latest
-          ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_VERSION }}
+          ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_DOCKER_TAG }}
           ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_COMMIT_HASH }}
         labels: |
           org.opencontainers.image.title=n8n Enterprise
@@ -199,7 +205,7 @@ jobs:
         echo "Available tags:"
         echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.IMAGE_TAG }}"
         echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:latest"
-        echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_VERSION }}"
+        echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_DOCKER_TAG }}"
         echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_COMMIT_HASH }}"
 
     - name: Clean up
