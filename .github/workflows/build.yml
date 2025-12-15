@@ -115,6 +115,26 @@ jobs:
         cd n8n-source
         pnpm run build
 
+    - name: Package for Docker
+      run: |
+        cd n8n-source
+        
+        # n8n's build:docker creates the compiled folder and builds the image
+        # We'll run it to get the compiled folder, then use our own buildx for multi-platform
+        echo "=== Running build:docker to create compiled folder ==="
+        pnpm run build:docker || echo "build:docker may have failed at docker step, checking for compiled folder..."
+        
+        # Verify compiled folder exists
+        if [ -d "compiled" ]; then
+          echo "✅ compiled folder created successfully"
+          ls -la compiled/
+        else
+          echo "❌ ERROR: compiled folder not found!"
+          echo "Root directory contents:"
+          ls -la
+          exit 1
+        fi
+
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
       with:
@@ -157,9 +177,9 @@ jobs:
       id: version
       run: |
         cd n8n-source
-        # Try to get version from package.json
+        # Try to get version from package.json (using grep/sed instead of jq)
         if [ -f "package.json" ]; then
-          N8N_PKG_VERSION=$(jq -r '.version // empty' package.json)
+          N8N_PKG_VERSION=$(grep -o '"version": *"[^"]*"' package.json | head -1 | sed 's/"version": *"\([^"]*\)"/\1/')
           if [ -n "$N8N_PKG_VERSION" ]; then
             echo "N8N_PKG_VERSION=$N8N_PKG_VERSION" >> $GITHUB_ENV
             echo "Found n8n version: $N8N_PKG_VERSION"
