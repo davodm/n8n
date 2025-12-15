@@ -10,10 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # Use repository owner as username, fallback to davodm
   DOCKER_USERNAME: ${{ github.repository_owner || 'davodm' }}
-  IMAGE_TAG: enterprise
-  # Match n8n official platforms: linux/amd64 and linux/arm64
   PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
@@ -27,41 +24,59 @@ jobs:
     - name: Checkout current repository
       uses: actions/checkout@v4
 
-    - name: Clone n8n repository
+    - name: Clone n8n repository and determine version
       id: clone-n8n
       run: |
         git clone https://github.com/n8n-io/n8n.git n8n-source
         cd n8n-source
         git fetch --tags
         
+        # Get the latest stable release from n8n (non-prerelease)
+        releases_json=$(curl -s https://api.github.com/repos/n8n-io/n8n/releases)
+        LATEST_STABLE_TAG=$(echo "$releases_json" | jq -r '.[] | select(.prerelease == false) | .tag_name' | head -n 1)
+        echo "Latest stable release on n8n: $LATEST_STABLE_TAG"
+        
         # Determine which version to build
         if [ -n "${{ github.event.inputs.n8n_version }}" ]; then
-          TARGET_TAG="${{ github.event.inputs.n8n_version }}"
+          INPUT_VERSION="${{ github.event.inputs.n8n_version }}"
+          # If input doesn't start with 'n8n@', prepend it (n8n uses n8n@x.x.x format)
+          if [[ "$INPUT_VERSION" != n8n@* ]]; then
+            TARGET_TAG="n8n@${INPUT_VERSION}"
+          else
+            TARGET_TAG="$INPUT_VERSION"
+          fi
           echo "Using manually specified version: $TARGET_TAG"
+          IS_LATEST_STABLE="false"
         else
-          # Get latest stable release (non-prerelease)
-          releases_json=$(curl -s https://api.github.com/repos/n8n-io/n8n/releases)
-          TARGET_TAG=$(echo "$releases_json" | jq -r '.[] | select(.prerelease == false) | .tag_name' | head -n 1)
+          TARGET_TAG="$LATEST_STABLE_TAG"
           echo "Using latest stable version: $TARGET_TAG"
+          IS_LATEST_STABLE="true"
         fi
+        
+        # Check if we're building the latest stable (for tagging decision)
+        if [ "$TARGET_TAG" = "$LATEST_STABLE_TAG" ]; then
+          IS_LATEST_STABLE="true"
+        fi
+        echo "IS_LATEST_STABLE=$IS_LATEST_STABLE" >> $GITHUB_ENV
         
         if [ -n "$TARGET_TAG" ]; then
           git checkout "$TARGET_TAG"
-          # Store original version for labels
           echo "N8N_VERSION=$TARGET_TAG" >> $GITHUB_ENV
-          # Sanitize version for Docker tag (replace @ with - and remove invalid chars)
-          DOCKER_TAG_VERSION=$(echo "$TARGET_TAG" | sed 's/@/-/g' | sed 's/[^a-zA-Z0-9._-]//g')
-          echo "N8N_DOCKER_TAG=$DOCKER_TAG_VERSION" >> $GITHUB_ENV
+          # Extract clean version number (remove n8n@ prefix for Docker tag)
+          CLEAN_VERSION=$(echo "$TARGET_TAG" | sed 's/^n8n@//')
+          echo "N8N_DOCKER_TAG=$CLEAN_VERSION" >> $GITHUB_ENV
         else
           echo "N8N_VERSION=dev" >> $GITHUB_ENV
           echo "N8N_DOCKER_TAG=dev" >> $GITHUB_ENV
+          echo "IS_LATEST_STABLE=false" >> $GITHUB_ENV
         fi
         
         N8N_COMMIT_HASH=$(git rev-parse --short HEAD)
         echo "Cloned n8n repository successfully"
         echo "Current commit: $N8N_COMMIT_HASH"
         echo "N8N_COMMIT_HASH=$N8N_COMMIT_HASH" >> $GITHUB_ENV
-        echo "Docker tag version: $DOCKER_TAG_VERSION"
+        echo "Docker version tag: $CLEAN_VERSION"
+        echo "Is latest stable: $IS_LATEST_STABLE"
 
     - name: Copy bypass script to n8n repository
       run: |
@@ -157,6 +172,30 @@ jobs:
           fi
         fi
 
+    - name: Generate Docker tags
+      id: docker-tags
+      run: |
+        REGISTRY="${{ env.REGISTRY }}"
+        USERNAME="${{ env.DOCKER_USERNAME }}"
+        BASE="${REGISTRY}/${USERNAME}/n8n"
+        
+        # Always include version tag and commit hash
+        TAGS="${BASE}:${{ env.N8N_DOCKER_TAG }}"
+        TAGS="${TAGS},${BASE}:${{ env.N8N_COMMIT_HASH }}"
+        
+        # Only add latest, stable, enterprise if this is the latest stable release
+        if [ "${{ env.IS_LATEST_STABLE }}" = "true" ]; then
+          TAGS="${TAGS},${BASE}:latest"
+          TAGS="${TAGS},${BASE}:stable"
+          TAGS="${TAGS},${BASE}:enterprise"
+          echo "Adding latest/stable/enterprise tags (building latest stable release)"
+        else
+          echo "Skipping latest/stable/enterprise tags (building specific version)"
+        fi
+        
+        echo "DOCKER_TAGS=${TAGS}" >> $GITHUB_ENV
+        echo "Generated tags: ${TAGS}"
+
     - name: Build and push multi-platform Docker image
       uses: docker/build-push-action@v6
       with:
@@ -164,11 +203,7 @@ jobs:
         file: ${{ github.workspace }}/n8n-source/${{ env.DOCKERFILE_PATH }}
         platforms: ${{ env.PLATFORMS }}
         push: true
-        tags: |
-          ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.IMAGE_TAG }}
-          ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:latest
-          ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_DOCKER_TAG }}
-          ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_COMMIT_HASH }}
+        tags: ${{ env.DOCKER_TAGS }}
         labels: |
           org.opencontainers.image.title=n8n Enterprise
           org.opencontainers.image.description=n8n with enterprise features enabled
@@ -182,7 +217,7 @@ jobs:
     - name: Verify pushed images
       run: |
         echo "=== Verifying multi-platform image ==="
-        docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.IMAGE_TAG }}
+        docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_DOCKER_TAG }}
         echo ""
         echo "✅ Successfully built and pushed multi-platform Docker image"
         echo ""
@@ -192,12 +227,16 @@ jobs:
         echo "  Platforms: ${{ env.PLATFORMS }}"
         echo "  n8n Version: ${{ env.N8N_VERSION }}"
         echo "  n8n Commit: ${{ env.N8N_COMMIT_HASH }}"
+        echo "  Is Latest Stable: ${{ env.IS_LATEST_STABLE }}"
         echo ""
-        echo "Available tags:"
-        echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.IMAGE_TAG }}"
-        echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:latest"
+        echo "Published tags:"
         echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_DOCKER_TAG }}"
         echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_COMMIT_HASH }}"
+        if [ "${{ env.IS_LATEST_STABLE }}" = "true" ]; then
+          echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:latest"
+          echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:stable"
+          echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:enterprise"
+        fi
 
     - name: Clean up
       if: always()
