@@ -2,11 +2,19 @@ name: Build and Push n8n Enterprise Docker Image
 
 on:
   workflow_dispatch:
+    inputs:
+      n8n_version:
+        description: 'Specific n8n version tag to build (leave empty for latest stable)'
+        required: false
+        default: ''
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: mroplus/n8n
+  # Use repository owner as username, fallback to davodm
+  DOCKER_USERNAME: ${{ github.repository_owner || 'davodm' }}
   IMAGE_TAG: enterprise
+  # Match n8n official platforms: linux/amd64 and linux/arm64
+  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
   build-and-push:
@@ -20,21 +28,34 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Clone n8n repository
+      id: clone-n8n
       run: |
         git clone https://github.com/n8n-io/n8n.git n8n-source
         cd n8n-source
         git fetch --tags
-
-        releases_json=$(curl -s https://api.github.com/repos/n8n-io/n8n/releases)
-        latest_stable_tag=$(echo "$releases_json" | jq -r '.[] | select(.prerelease == false) | .tag_name' | head -n 1)
-        if [ -n "$latest_stable_tag" ]; then
-          git checkout "$latest_stable_tag"
+        
+        # Determine which version to build
+        if [ -n "${{ github.event.inputs.n8n_version }}" ]; then
+          TARGET_TAG="${{ github.event.inputs.n8n_version }}"
+          echo "Using manually specified version: $TARGET_TAG"
+        else
+          # Get latest stable release (non-prerelease)
+          releases_json=$(curl -s https://api.github.com/repos/n8n-io/n8n/releases)
+          TARGET_TAG=$(echo "$releases_json" | jq -r '.[] | select(.prerelease == false) | .tag_name' | head -n 1)
+          echo "Using latest stable version: $TARGET_TAG"
         fi
-
-        n8n_commit_hash=$(git rev-parse HEAD)
+        
+        if [ -n "$TARGET_TAG" ]; then
+          git checkout "$TARGET_TAG"
+          echo "N8N_VERSION=$TARGET_TAG" >> $GITHUB_ENV
+        else
+          echo "N8N_VERSION=dev" >> $GITHUB_ENV
+        fi
+        
+        N8N_COMMIT_HASH=$(git rev-parse --short HEAD)
         echo "Cloned n8n repository successfully"
-        echo "Current commit: $n8n_commit_hash"
-        echo "N8N_COMMIT_HASH=$n8n_commit_hash" >> $GITHUB_ENV
+        echo "Current commit: $N8N_COMMIT_HASH"
+        echo "N8N_COMMIT_HASH=$N8N_COMMIT_HASH" >> $GITHUB_ENV
 
     - name: Copy bypass script to n8n repository
       run: |
@@ -42,7 +63,8 @@ jobs:
           cp bypass.sh n8n-source/
           echo "bypass.sh copied to n8n-source directory"
         else
-          echo "bypass.sh not found in current repository"
+          echo "⚠️ bypass.sh not found in current repository"
+          exit 1
         fi
 
     - name: Setup Node.js
@@ -61,7 +83,7 @@ jobs:
         echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
 
     - name: Setup pnpm cache
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ${{ env.STORE_PATH }}
         key: ${{ runner.os }}-pnpm-store-${{ hashFiles('n8n-source/pnpm-lock.yaml') }}
@@ -76,20 +98,21 @@ jobs:
     - name: Run bypass script
       run: |
         cd n8n-source
-        if [ -f "bypass.sh" ]; then
-          # Convert Windows line endings to Unix
-          sed -i 's/\r$//' bypass.sh
-          chmod +x bypass.sh
-          ./bypass.sh --auto
-          echo "bypass.sh executed successfully with --auto mode"
-        else
-          echo "bypass.sh not found in n8n repository, skipping..."
-        fi
+        # Convert Windows line endings to Unix
+        sed -i 's/\r$//' bypass.sh
+        chmod +x bypass.sh
+        ./bypass.sh --auto
+        echo "bypass.sh executed successfully with --auto mode"
 
     - name: Build n8n
       run: |
         cd n8n-source
         pnpm run build
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: all
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -101,141 +124,86 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Extract metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-        tags: |
-          type=ref,event=branch
-          type=ref,event=pr
-          type=raw,value=${{ env.IMAGE_TAG }}
-          type=raw,value=latest,enable={{is_default_branch}}
-          type=sha,prefix={{branch}}-
-
-    - name: Build Docker image
-      run: |
-        cd n8n-source
-        pnpm run build:docker
-
-    - name: Tag and push Docker image
+    - name: Determine Dockerfile path
+      id: dockerfile-info
       run: |
         cd n8n-source
         
-        # List all available images for debugging
-        echo "Available Docker images:"
-        docker images
-        
-        echo "Available Podman images:"
-        podman images
-        
-        # The n8n build process uses podman, so look for the image there first
-        echo "=== SEARCHING FOR N8N IMAGE IN PODMAN ==="
-        
-        # First, let's see all podman images for debugging
-        echo "All podman images:"
-        podman images
-        
-        # Look for n8n images in podman with exact matching
-        echo "Searching for n8n images..."
-        PODMAN_N8N_IMAGES=$(podman images --format "{{.Repository}} {{.Tag}} {{.ID}}" | grep "n8nio/n8n" || true)
-        
-        if [ -z "$PODMAN_N8N_IMAGES" ]; then
-          echo "No n8nio/n8n images found in podman, trying localhost prefix..."
-          PODMAN_N8N_IMAGES=$(podman images --format "{{.Repository}} {{.Tag}} {{.ID}}" | grep "localhost/n8nio/n8n" || true)
-        fi
-        
-        echo "Found n8n images in podman:"
-        echo "$PODMAN_N8N_IMAGES"
-        
-        if [ -n "$PODMAN_N8N_IMAGES" ]; then
-          # Get the first (most recent) n8n image
-          PODMAN_IMAGE=$(echo "$PODMAN_N8N_IMAGES" | head -1)
-          PODMAN_REPO=$(echo "$PODMAN_IMAGE" | awk '{print $1}')
-          PODMAN_TAG=$(echo "$PODMAN_IMAGE" | awk '{print $2}')
-          PODMAN_IMAGE_ID=$(echo "$PODMAN_IMAGE" | awk '{print $3}')
-          PODMAN_IMAGE_NAME="${PODMAN_REPO}:${PODMAN_TAG}"
-          
-          echo "=== SELECTED IMAGE ==="
-          echo "Repository: $PODMAN_REPO"
-          echo "Tag: $PODMAN_TAG"  
-          echo "ID: $PODMAN_IMAGE_ID"
-          echo "Full name: $PODMAN_IMAGE_NAME"
-          
-          # Verify the image exists in podman before transfer
-          if ! podman image exists "$PODMAN_IMAGE_NAME"; then
-            echo "ERROR: Image $PODMAN_IMAGE_NAME does not exist in podman!"
-            exit 1
-          fi
-          
-          echo "=== TRANSFERRING IMAGE FROM PODMAN TO DOCKER ==="
-          # Transfer with error checking
-          if podman save "$PODMAN_IMAGE_NAME" | docker load; then
-            echo "✅ Image transfer successful"
-          else
-            echo "❌ Image transfer failed"
-            exit 1
-          fi
-          
-          # Verify the image now exists in docker
-          echo "=== VERIFYING IMAGE IN DOCKER ==="
-          docker images
-          
-          # Find the transferred image in docker
-          IMAGE_ID=$(docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep -E "(n8nio/n8n|localhost/n8nio/n8n)" | head -1 | awk '{print $2}')
-          
-          if [ -z "$IMAGE_ID" ]; then
-            echo "❌ Image not found in docker after transfer. Trying alternative search..."
-            # Try without the localhost prefix in case docker strips it
-            IMAGE_ID=$(docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep "n8nio/n8n" | head -1 | awk '{print $2}')
-          fi
-          
+        # n8n's standard Dockerfile location
+        if [ -f "docker/images/n8n/Dockerfile" ]; then
+          DOCKERFILE_PATH="docker/images/n8n/Dockerfile"
+        elif [ -f "Dockerfile" ]; then
+          DOCKERFILE_PATH="Dockerfile"
         else
-          echo "=== NO N8N IMAGE IN PODMAN - CHECKING DOCKER DIRECTLY ==="
-          IMAGE_ID=$(docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep -E "(n8nio/n8n|n8n-io/n8n)" | head -1 | awk '{print $2}')
-        fi
-        
-        if [ -z "$IMAGE_ID" ]; then
-          echo "❌ FATAL ERROR: Could not find n8n Docker image!"
-          echo "Expected patterns: localhost/n8nio/n8n, n8nio/n8n, or n8n-io/n8n"
-          echo "Final docker images list:"
-          docker images
+          echo "❌ ERROR: Dockerfile not found!"
+          find . -name "Dockerfile" -type f
           exit 1
         fi
         
-        echo "Found Docker image with ID: $IMAGE_ID"
-        echo "N8N commit hash: ${{ env.N8N_COMMIT_HASH }}"
+        echo "DOCKERFILE_PATH=$DOCKERFILE_PATH" >> $GITHUB_ENV
+        echo "Found Dockerfile at: $DOCKERFILE_PATH"
         
-        # Tag the image for GHCR with your custom tags
-        docker tag $IMAGE_ID ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-        docker tag $IMAGE_ID ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-        docker tag $IMAGE_ID ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-        docker tag $IMAGE_ID ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:n8n-${{ env.N8N_COMMIT_HASH }}
-        
-        # Also tag with metadata-generated tags for additional flexibility
-        echo "Adding metadata-generated tags..."
-        IFS=$'\n'
-        for tag in $(echo '${{ steps.meta.outputs.tags }}' | tr ',' '\n'); do
-          echo "Tagging: $tag"
-          docker tag $IMAGE_ID $tag
-        done
-        
-        # Push your custom tags
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:n8n-${{ env.N8N_COMMIT_HASH }}
-        
-        # Push metadata-generated tags
-        echo "Pushing metadata-generated tags..."
-        for tag in $(echo '${{ steps.meta.outputs.tags }}' | tr ',' '\n'); do
-          echo "Pushing: $tag"
-          docker push $tag
-        done
-        
-        echo "Successfully pushed Docker image to GHCR"
+        # Display Dockerfile for debugging
+        echo "=== Dockerfile contents (first 50 lines) ==="
+        head -50 "$DOCKERFILE_PATH"
+
+    - name: Extract n8n version for tagging
+      id: version
+      run: |
+        cd n8n-source
+        # Try to get version from package.json
+        if [ -f "package.json" ]; then
+          N8N_PKG_VERSION=$(jq -r '.version // empty' package.json)
+          if [ -n "$N8N_PKG_VERSION" ]; then
+            echo "N8N_PKG_VERSION=$N8N_PKG_VERSION" >> $GITHUB_ENV
+            echo "Found n8n version: $N8N_PKG_VERSION"
+          fi
+        fi
+
+    - name: Build and push multi-platform Docker image
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ github.workspace }}/n8n-source
+        file: ${{ github.workspace }}/n8n-source/${{ env.DOCKERFILE_PATH }}
+        platforms: ${{ env.PLATFORMS }}
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.IMAGE_TAG }}
+          ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:latest
+          ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_VERSION }}
+          ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_COMMIT_HASH }}
+        labels: |
+          org.opencontainers.image.title=n8n Enterprise
+          org.opencontainers.image.description=n8n with enterprise features enabled
+          org.opencontainers.image.version=${{ env.N8N_VERSION }}
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.revision=${{ env.N8N_COMMIT_HASH }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        provenance: false
+
+    - name: Verify pushed images
+      run: |
+        echo "=== Verifying multi-platform image ==="
+        docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.IMAGE_TAG }}
+        echo ""
+        echo "✅ Successfully built and pushed multi-platform Docker image"
+        echo ""
+        echo "Image details:"
+        echo "  Registry: ${{ env.REGISTRY }}"
+        echo "  Repository: ${{ env.DOCKER_USERNAME }}/n8n"
+        echo "  Platforms: ${{ env.PLATFORMS }}"
+        echo "  n8n Version: ${{ env.N8N_VERSION }}"
+        echo "  n8n Commit: ${{ env.N8N_COMMIT_HASH }}"
+        echo ""
+        echo "Available tags:"
+        echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.IMAGE_TAG }}"
+        echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:latest"
+        echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_VERSION }}"
+        echo "  - ${{ env.REGISTRY }}/${{ env.DOCKER_USERNAME }}/n8n:${{ env.N8N_COMMIT_HASH }}"
 
     - name: Clean up
       if: always()
       run: |
-        docker system prune -f
+        docker buildx prune -f || true
+        docker system prune -f || true

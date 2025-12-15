@@ -1,6 +1,6 @@
 services:
   n8n:
-    image: ghcr.io/mroplus/n8n:enterprise
+    image: ghcr.io/davodm/n8n:enterprise
     ports:
       - "5678:5678"      
     volumes:
