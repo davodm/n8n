@@ -78,59 +78,40 @@ jobs:
       with:
         node-version: '22'
 
-    - name: Install pnpm
+    - name: Install pnpm and setup cache
       uses: pnpm/action-setup@v2
       with:
         version: latest
 
-    - name: Get pnpm store directory
-      shell: bash
-      run: |
-        echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-    - name: Setup pnpm cache
+    - name: Cache pnpm store
       uses: actions/cache@v4
       with:
-        path: ${{ env.STORE_PATH }}
+        path: ~/.local/share/pnpm/store
         key: ${{ runner.os }}-pnpm-store-${{ hashFiles('n8n-source/pnpm-lock.yaml') }}
         restore-keys: |
           ${{ runner.os }}-pnpm-store-
 
-    - name: Install dependencies
+    - name: Apply bypass and build n8n
       run: |
         cd n8n-source
-        pnpm install --frozen-lockfile
-
-    - name: Run bypass script
-      run: |
-        cd n8n-source
-        # Convert Windows line endings to Unix
+        
+        # Run bypass script to modify source files before build
         sed -i 's/\r$//' bypass.sh
         chmod +x bypass.sh
         ./bypass.sh --auto
-        echo "bypass.sh executed successfully with --auto mode"
-
-    - name: Build n8n
-      run: |
-        cd n8n-source
-        pnpm run build
-
-    - name: Package for Docker
-      run: |
-        cd n8n-source
+        echo "✅ Bypass script executed successfully"
         
-        # n8n's build:docker creates the compiled folder and builds the image
-        # We'll run it to get the compiled folder, then use our own buildx for multi-platform
-        echo "=== Running build:docker to create compiled folder ==="
-        pnpm run build:docker || echo "build:docker may have failed at docker step, checking for compiled folder..."
+        # build:docker handles: install → build → create compiled folder
+        # The dockerize step may fail (we use our own buildx), but compiled folder will be created
+        echo "=== Running build:docker ==="
+        pnpm run build:docker || echo "Docker step skipped, checking compiled folder..."
         
         # Verify compiled folder exists
         if [ -d "compiled" ]; then
-          echo "✅ compiled folder created successfully"
+          echo "✅ Compiled folder created successfully"
           ls -la compiled/
         else
           echo "❌ ERROR: compiled folder not found!"
-          echo "Root directory contents:"
           ls -la
           exit 1
         fi
@@ -150,12 +131,11 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Determine Dockerfile path
-      id: dockerfile-info
+    - name: Prepare Docker build metadata
       run: |
         cd n8n-source
         
-        # n8n's standard Dockerfile location
+        # Determine Dockerfile location
         if [ -f "docker/images/n8n/Dockerfile" ]; then
           DOCKERFILE_PATH="docker/images/n8n/Dockerfile"
         elif [ -f "Dockerfile" ]; then
@@ -165,19 +145,10 @@ jobs:
           find . -name "Dockerfile" -type f
           exit 1
         fi
-        
         echo "DOCKERFILE_PATH=$DOCKERFILE_PATH" >> $GITHUB_ENV
         echo "Found Dockerfile at: $DOCKERFILE_PATH"
         
-        # Display Dockerfile for debugging
-        echo "=== Dockerfile contents (first 50 lines) ==="
-        head -50 "$DOCKERFILE_PATH"
-
-    - name: Extract n8n version for tagging
-      id: version
-      run: |
-        cd n8n-source
-        # Try to get version from package.json (using grep/sed instead of jq)
+        # Extract version from package.json
         if [ -f "package.json" ]; then
           N8N_PKG_VERSION=$(grep -o '"version": *"[^"]*"' package.json | head -1 | sed 's/"version": *"\([^"]*\)"/\1/')
           if [ -n "$N8N_PKG_VERSION" ]; then
