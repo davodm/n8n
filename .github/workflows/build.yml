@@ -115,6 +115,21 @@ jobs:
         cd n8n-source
         pnpm run build
 
+    - name: Package for Docker
+      run: |
+        cd n8n-source
+        # n8n uses 'pnpm package' to create the compiled folder for Docker
+        pnpm run package
+        
+        # Verify compiled folder exists
+        if [ -d "compiled" ]; then
+          echo "✅ compiled folder created successfully"
+          ls -la compiled/
+        else
+          echo "❌ ERROR: compiled folder not found!"
+          exit 1
+        fi
+
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
       with:
