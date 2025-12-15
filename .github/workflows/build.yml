@@ -106,17 +106,22 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-pnpm-store-
 
+    - name: Install dependencies
+      run: |
+        cd n8n-source
+        pnpm install --frozen-lockfile
+
     - name: Apply bypass and build n8n
       run: |
         cd n8n-source
         
-        # Run bypass script to modify source files before build
+        # Apply bypass modifications to source files
         sed -i 's/\r$//' bypass.sh
         chmod +x bypass.sh
         ./bypass.sh --auto
         echo "✅ Bypass script executed successfully"
         
-        # build:docker handles: install → build → create compiled folder
+        # build:docker runs: install (quick, already done) → build → create compiled folder
         # The dockerize step may fail (we use our own buildx), but compiled folder will be created
         echo "=== Running build:docker ==="
         pnpm run build:docker || echo "Docker step skipped, checking compiled folder..."
