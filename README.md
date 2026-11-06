@@ -55,12 +55,12 @@ Every successful build pushes one multi-arch (`linux/amd64`, `linux/arm64`) mani
 
 | Tag | Meaning |
 | --- | --- |
-| `ghcr.io/mroplus/n8n:enterprise` | Main enterprise tag |
-| `ghcr.io/mroplus/n8n:latest` | Latest build |
-| `ghcr.io/mroplus/n8n:<n8n-version>` | n8n release version, e.g. `2.32.7` |
-| `ghcr.io/mroplus/n8n:<version>-b<hash>` | Build key — version plus the `bypass.sh` revision |
-| `ghcr.io/mroplus/n8n:<commit-sha>` | Commit of *this* repository |
-| `ghcr.io/mroplus/n8n:n8n-<commit-hash>` | Commit of the n8n source repository |
+| `ghcr.io/davodm/n8n:enterprise` | Main enterprise tag |
+| `ghcr.io/davodm/n8n:latest` | Latest build |
+| `ghcr.io/davodm/n8n:<n8n-version>` | n8n release version, e.g. `2.32.7` |
+| `ghcr.io/davodm/n8n:<version>-b<hash>` | Build key — version plus the `bypass.sh` revision |
+| `ghcr.io/davodm/n8n:<commit-sha>` | Commit of *this* repository |
+| `ghcr.io/davodm/n8n:n8n-<commit-hash>` | Commit of the n8n source repository |
 
 The build key is what makes a rebuild happen: changing `bypass.sh` changes the key, so patch
 changes ship without waiting for a new n8n release.
@@ -87,8 +87,8 @@ Authentication uses the `GITHUB_TOKEN` provided by GitHub Actions. No additional
 ## Pulling the Image
 
 ```bash
-docker pull ghcr.io/mroplus/n8n:enterprise
-docker run -d --name n8n -p 5678:5678 -v n8n_data:/home/node/.n8n ghcr.io/mroplus/n8n:enterprise
+docker pull ghcr.io/davodm/n8n:enterprise
+docker run -d --name n8n -p 5678:5678 -v n8n_data:/home/node/.n8n ghcr.io/davodm/n8n:enterprise
 ```
 
 Or use the provided `compose.yml`:
