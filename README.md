@@ -1,142 +1,128 @@
 # n8n Enterprise Docker Build Workflow
 
-This repository contains a GitHub Actions workflow that automatically builds and pushes n8n Docker images with enterprise features enabled to GitHub Container Registry (GHCR).
+This repository contains a GitHub Actions workflow that builds n8n from source with the license
+bypass patches applied, and pushes the resulting Docker image to GitHub Container Registry (GHCR).
 
 ## Workflow Overview
 
-The workflow (`build.yml`) performs the following steps:
+`.github/workflows/build.yml` runs three jobs:
 
-1. **Clone n8n Repository**: Clones the official n8n repository from `https://github.com/n8n-io/n8n` and checks out the latest stable release (or specified version)
-2. **Setup Environment**: Installs Node.js 22 and pnpm package manager
-3. **Apply Enterprise Bypass**: Copies and runs the `bypass.sh` script to enable enterprise features
-4. **Install Dependencies**: Runs `pnpm install --frozen-lockfile`
-5. **Build Project**: Executes `pnpm run build` to compile n8n
-6. **Build Multi-Platform Docker Image**: Uses Docker Buildx to build images for both `linux/amd64` and `linux/arm64` architectures
-7. **Push to GHCR**: Tags and pushes the multi-platform image to GitHub Container Registry
+**`check-version`**
+1. Resolves the latest stable n8n release tag (`n8n@X.Y.Z`)
+2. Computes a *build key* — `<version>-b<short hash of bypass.sh>`
+3. Skips the build if that exact key was already pushed to GHCR
 
-## Features
+**`build`** — runs once per architecture (`amd64` on `ubuntu-latest`, `arm64` on `ubuntu-24.04-arm`)
+1. Clones n8n at the resolved release tag
+2. Installs dependencies with pnpm
+3. Applies `bypass.sh`, which verifies every patch and fails the build if any of them no longer apply
+4. Builds n8n (`pnpm run build`) and the Docker image (`pnpm run build:docker`)
+5. Smoke tests the image (see below)
+6. Pushes it under an architecture-suffixed tag (`<version>-b<hash>-amd64` / `-arm64`)
 
-- ✅ **Multi-Platform Support**: Builds for both AMD64 and ARM64 architectures (matches official n8n platforms)
-- ✅ **Enterprise Features**: Automatically applies license bypass to enable all enterprise features
-- ✅ **Version Control**: Supports building specific n8n versions or latest stable release
-- ✅ **Smart Caching**: Uses GitHub Actions cache for faster builds
-- ✅ **Flexible Username**: Uses repository owner as username, with fallback to `davodm`
+**`manifest`**
+1. Merges the two per-architecture images into one multi-arch manifest
+2. Applies every public tag to that manifest
+3. Fails if the manifest does not contain exactly `linux/amd64` and `linux/arm64`
+
+Each architecture builds natively. n8n's dependency tree contains architecture-specific binaries,
+and emulating arm64 under QEMU is far slower than a native runner. Public tags only move after
+both architectures built, passed the smoke test, and were merged, so `enterprise` and `latest`
+never point at a single-arch image.
+
+### Smoke test
+
+Before anything is pushed, each image is booted twice: as the default `node` user and as an
+arbitrary UID (`--user 12345:0`, what OpenShift does). Each must reach `/healthz/readiness` and
+report `saml`, `ldap` and `oidc` as enabled on `/rest/settings` — all `false` on stock n8n. This
+checks that the bypass took effect at runtime, not only in the source.
+
+> Only immutable `n8n@X.Y.Z` tags are considered. Upstream also publishes moving `stable` and
+> `beta` releases; building from those produced non-reproducible images and permanently wedged
+> the skip check, so they are filtered out.
 
 ## Triggers
 
-The workflow runs on:
-- Manual trigger via GitHub Actions UI (`workflow_dispatch`) with optional version input
+- Weekly schedule — Sundays at 00:00 UTC
+- Manual trigger via the Actions UI (`workflow_dispatch`), with optional inputs:
+  - `n8n_tag` — build a specific release instead of the latest stable (e.g. `n8n@2.32.7`)
+  - `force_build` — build even if the build key already exists in the registry
+  - `push` — set to `false` for a dry run: builds and smoke tests both architectures, pushes nothing
 
 ## Docker Image Tags
 
-The workflow creates multiple tags for the Docker image. The username is automatically determined from the repository owner (falls back to `davodm` if not available):
+Every successful build pushes one multi-arch (`linux/amd64`, `linux/arm64`) manifest under each of these tags:
 
-- `ghcr.io/<username>/n8n:enterprise` - Main enterprise tag
-- `ghcr.io/<username>/n8n:latest` - Latest build tag
-- `ghcr.io/<username>/n8n:<n8n-version>` - Specific n8n version (e.g., `n8n@1.70.0`)
-- `ghcr.io/<username>/n8n:<commit-hash>` - Specific n8n commit hash
+| Tag | Meaning |
+| --- | --- |
+| `ghcr.io/mroplus/n8n:enterprise` | Main enterprise tag |
+| `ghcr.io/mroplus/n8n:latest` | Latest build |
+| `ghcr.io/mroplus/n8n:<n8n-version>` | n8n release version, e.g. `2.32.7` |
+| `ghcr.io/mroplus/n8n:<version>-b<hash>` | Build key — version plus the `bypass.sh` revision |
+| `ghcr.io/mroplus/n8n:<commit-sha>` | Commit of *this* repository |
+| `ghcr.io/mroplus/n8n:n8n-<commit-hash>` | Commit of the n8n source repository |
 
-**Example** (if repository owner is `davodm`):
-- `ghcr.io/davodm/n8n:enterprise`
-- `ghcr.io/davodm/n8n:latest`
-- `ghcr.io/davodm/n8n:n8n@1.70.0`
-- `ghcr.io/davodm/n8n:abc1234`
+The build key is what makes a rebuild happen: changing `bypass.sh` changes the key, so patch
+changes ship without waiting for a new n8n release.
 
-## Platform Support
+## What `bypass.sh` Patches
 
-The workflow builds multi-platform images supporting:
-- `linux/amd64` - Intel/AMD 64-bit processors
-- `linux/arm64` - ARM 64-bit processors (including Apple Silicon)
+- `packages/@n8n/backend-common/src/license-state.ts` — license checks return `true`, quotas unlimited
+- `packages/cli/src/license.ts` — same, for the deprecated wrappers still in use
+- `ProjectTabs.vue` — the Variables tab is always shown
+- `NonProductionLicenseBanner.vue` — banner hidden
+- `docker/images/n8n/Dockerfile` — stable release type, plus arbitrary-UID support (see below)
 
-This matches the official n8n Docker image platform support.
+Each patch is verified after it is applied. `sed`/`perl` exit 0 whether or not a pattern matched,
+so without those checks an upstream refactor silently produces a half-patched image that still
+reports a green build. If a patch no longer applies, the script lists it and exits non-zero.
 
 ## Required Permissions
 
-The workflow requires the following permissions (already configured):
-- `contents: read` - To checkout the repository
-- `packages: write` - To push Docker images to GHCR
+- `contents: read` — to check out the repository
+- `packages: write` — to push Docker images to GHCR
 
-## Authentication
-
-The workflow uses the `GITHUB_TOKEN` automatically provided by GitHub Actions. No additional secrets need to be configured for GHCR access.
-
-## Usage
-
-### Manual Trigger
-
-1. Go to the **Actions** tab in your GitHub repository
-2. Select **Build and Push n8n Enterprise Docker Image** workflow
-3. Click **Run workflow**
-4. Optionally specify a n8n version tag (leave empty for latest stable)
-5. Click **Run workflow** button
-
-### Building Specific Versions
-
-When manually triggering the workflow, you can specify a specific n8n version tag (e.g., `n8n@1.70.0`). If left empty, it will build the latest stable release.
+Authentication uses the `GITHUB_TOKEN` provided by GitHub Actions. No additional secrets are needed.
 
 ## Pulling the Image
 
-To use the built Docker image (replace `<username>` with your repository owner or `davodm`):
-
 ```bash
-# Pull the enterprise image
-docker pull ghcr.io/<username>/n8n:enterprise
-
-# Run n8n
-docker run -d --name n8n -p 5678:5678 ghcr.io/<username>/n8n:enterprise
+docker pull ghcr.io/mroplus/n8n:enterprise
+docker run -d --name n8n -p 5678:5678 -v n8n_data:/home/node/.n8n ghcr.io/mroplus/n8n:enterprise
 ```
 
-### Using Docker Compose
+Or use the provided `compose.yml`:
 
-Update `compose.yml` with your username:
-
-```yaml
-services:
-  n8n:
-    image: ghcr.io/<username>/n8n:enterprise
-    ports:
-      - "5678:5678"
-    # ... rest of configuration
-```
-
-Then run:
 ```bash
+docker volume create n8n_data
 docker compose up -d
 ```
 
-## Image Username
+## Running on Kubernetes / OpenShift
 
-The Docker image username is automatically determined:
-- **Primary**: Uses the GitHub repository owner (e.g., if repo is `davodm/n8n`, username is `davodm`)
-- **Fallback**: If repository owner is not available, defaults to `davodm`
+The image supports arbitrary UIDs: `/home/node` is group-0 writable and `N8N_USER_FOLDER` is pinned
+to `/home/node`, so it runs under OpenShift's `restricted-v2` SCC without an `anyuid` exception.
 
-This ensures the image path matches your GitHub username while providing a sensible default.
+```yaml
+env:
+  - name: N8N_USER_FOLDER
+    value: /home/node
+volumeMounts:
+  - name: n8n-data
+    mountPath: /home/node/.n8n
+```
+
+> **`N8N_USER_FOLDER` must not include `.n8n`.** n8n appends `.n8n` itself, so setting it to
+> `/home/node/.n8n` makes n8n target `/home/node/.n8n/.n8n` and fail with
+> `EACCES: permission denied`.
 
 ## Troubleshooting
 
-- **Check the Actions tab** in your GitHub repository for detailed build logs
-- **Ensure Actions are enabled** in your repository settings
-- **Verify GHCR access** - Make sure your account has permission to publish packages
-- **Check repository visibility** - Private repos may need additional permissions
-- **Verify bypass.sh exists** - The workflow requires `bypass.sh` in the repository root
-- **Check Dockerfile location** - The workflow looks for `docker/images/n8n/Dockerfile` in the n8n source
-
-## Monitoring
-
-The workflow includes:
-- **Detailed logging** for each build step
-- **Image verification** to confirm multi-platform support
-- **Cleanup steps** to prevent disk space issues
-- **Build caching** for faster subsequent builds
-
-## Differences from Official n8n Image
-
-This workflow creates a modified version of n8n with:
-- All enterprise features enabled (via license bypass)
-- Same platform support as official n8n (`linux/amd64`, `linux/arm64`)
-- Custom tagging system for version tracking
-- Built from the same source code as official n8n
-
-## License
-
-This workflow is for development and testing purposes. Please ensure you comply with n8n's license terms when using this modified image.
+- Check the Actions tab for build logs
+- A run that finishes in seconds means `check-version` skipped the build — the build key already
+  exists in GHCR. Re-run with `force_build` to rebuild anyway.
+- `Smoke test failed` means the image built but did not boot, or booted without the enterprise flags on;
+  the step prints the container logs or the `/rest/settings` payload.
+- Use `push: false` to rehearse a change end to end without publishing.
+- `Bypass patch drifted` errors mean upstream n8n moved something `bypass.sh` targets; the
+  annotation names which patch needs updating.
